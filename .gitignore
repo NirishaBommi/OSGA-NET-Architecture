@@ -1,0 +1,52 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ── Virtual environment ──
+.venv/
+venv/
+env/
+
+# ── Node / Frontend ──
+osga_net/frontend/node_modules/
+osga_net/frontend/.vite/
+
+# ── Model checkpoints (too large for GitHub) ──
+osga_net/runs/osga/*.pt
+*.pt
+*.pth
+*.ckpt
+
+# ── Dataset images (download from Kaggle) ──
+osga_net/data/raw/
+osga_net/data/uploads/
+*.zip
+
+# ── SQLite database ──
+*.db
+*.db-journal
+*.db-wal
+
+# ── IDE ──
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS files ──
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── Logs ──
+*.log
+
+# ── Misc ──
+.env
+.env.local

@@ -1,0 +1,496 @@
+OSGA-Net: An Ossification-Structure Graph Attention Network with FiLM Metadata Conditioning and Ordinal Distribution Regression for Bone Age Assessment from Hand Radiographs
+J. Nagaraju¹, Co-Author Name²
+¹ ² Department of Artificial Intelligence & Data Science
+Lakireddy Bali Reddy College of Engineering
+Andhra Pradesh, India
+
+Abstract—Bone age assessment (BAA) from left-hand radiographs is a routine clinical procedure used to evaluate skeletal maturity in pediatric endocrinology and growth-disorder diagnosis. Existing deep learning approaches typically treat the hand radiograph as a single global feature vector, fusing it with clinical metadata through late concatenation or cross-attention pooling. Both overlook that ossification centers across the hand mature in correlated, anatomically structured trajectories rather than independently. This paper proposes OSGA-Net, an Ossification-Structure Graph Attention Network that localizes thirteen anatomically defined ossification regions via an auxiliary landmark-heatmap head, conditions each region on patient sex and chronological age through per-node FiLM modulation, reasons jointly over regions using a Graph Attention Network defined on an anatomically motivated adjacency, and predicts bone age as a calibrated ordinal probability distribution trained with a KL-divergence label-distribution loss. Rather than reporting real oriented data numbers for the proposed model, this paper situates OSGA-Net against a literature-reported baseline table compiled exclusively from published results measured on the real, publicly available RSNA Pediatric Bone Age dataset (14,236 radiographs from Stanford University and Children's Hospital Colorado), and specifies the exact protocol, hyperparameters, and ablation plan under which OSGA-Net itself is to be trained and evaluated on that same real dataset prior to publication.
+Index Terms—Bone age assessment, hand radiograph, graph attention network, FiLM conditioning, ossification landmark detection, label distribution learning, ordinal regression, RSNA dataset.
+I. INTRODUCTION
+A. Clinical Background
+Skeletal bone age assessment (BAA) is a well-established radiological technique used to estimate a child's biological maturity from the ossification pattern of the bones in a left-hand radiograph, compared against chronological age [1], [2]. It is central to diagnosing endocrine and growth disorders — including growth hormone deficiency, precocious or delayed puberty, and idiopathic short stature — to planning orthopedic and orthodontic interventions timed against a patient's remaining growth potential, and, in some jurisdictions, to forensic and immigration age estimation [3]. A discrepancy of even a few months between assessed and chronological age can materially change a treatment decision in these settings, which is part of why the RSNA challenge organizers chose to benchmark against a six-rater consensus label rather than a single radiologist's reading [16]. The classical Greulich-Pyle (G&P) atlas-matching method and the Tanner-Whitehouse (TW) scoring method remain the clinical standard, but both require an experienced pediatric radiologist and exhibit inter-observer discrepancies of several months to over a year [16], [17], motivating decades of interest in automation.
+B. The RSNA Benchmark and Prior Progress
+Deep learning has automated BAA since the 2017 RSNA Pediatric Bone Age Machine Learning Challenge [16], which released 14,236 hand radiographs from Children's Hospital Colorado and Lucile Packard Children's Hospital at Stanford, split into 12,611 training, 1,425 validation, and 200 test images, and which remains the de facto benchmark for the field [16], [17], [31]. On this real benchmark, the best five challenge submissions achieved mean absolute distances (MAD) of 4.2, 4.4, 4.4, 4.5, and 4.5 months respectively, with the first-place "16Bit" Inception-V3-based model reaching an MAD of 4.265 months and a concordance correlation coefficient of 0.991 [16]. Architectures built on this benchmark since then span attention-guided CNNs [12], part-relation networks [21], transformer hybrids [3], [9], two-stream global-local fusion networks [22], and multi-modal fusion models that combine the radiograph with patient sex and chronological age [1], [5]. Reported MAE on the real RSNA test set has fallen substantially over this period — from 9.6 months for early end-to-end CNNs [18] to under 4 months for the most recent two-stream and transformer-based models [3], [22] — yet two limitations persist across nearly all of this literature.
+C. Problem Formulation
+Formally, given a hand radiograph I and clinical metadata m = (s, a) (sex s and chronological age a), the BAA task learns a function f(I, m) → y that predicts bone age y, typically trained by minimizing a distance between y and a radiologist-assigned label y* over a labeled dataset D = {(I_i, m_i, y*_i)}. The great majority of prior work instantiates f as g(pool(CNN(I)), m) for some pooling operator (global average pooling, or a single cross-attention pass) and some fusion operator g (concatenation followed by fully connected layers, or a query-based attention block). This formulation implicitly treats the hand as an unstructured signal: pool(CNN(I)) discards the identity and spatial relationship of individual ossification centers before metadata is even introduced. This paper instead formulates BAA as inference over a graph of R anatomically defined regions, y = h(GAT(FiLM(RoI(CNN(I), Land(I)), m), A)), where Land(I) localizes the regions, FiLM conditions each region on m, GAT reasons over a fixed anatomical adjacency A, and h decodes a calibrated distribution rather than a scalar.
+First, image-metadata fusion is almost always performed at the level of a single pooled feature vector, whether via concatenation [1], [5] or cross-attention, without modeling the hand as a structured anatomical system. Second, nearly all models output a single scalar bone-age prediction, discarding the ambiguity documented in inter-rater studies [16], [17] and in the RSNA challenge's own use of a six-rater weighted-average test label for its final leaderboard [16].
+D. Motivation for a Structural Approach
+Radiologists assess bone age by examining the joint developmental state of specific ossification centers — the carpal bones, the epiphyses of the metacarpals and phalanges, and the distal radius and ulna — and reasoning about how their maturation stages relate to one another [2]. A flat, globally pooled CNN feature, even when attention-weighted, does not explicitly represent this anatomical structure or the relations between regions; it is precisely this structure that TW-style scoring rules encode by assigning a separate maturity stage to each of several named bones and combining them into a final score. This motivates a model that (i) explicitly localizes these regions, (ii) reasons over them as a structured graph rather than a flat vector, and (iii) outputs a distribution over plausible ages rather than a single deterministic value.
+E. Contributions
+This paper proposes OSGA-Net, combining an ossification-landmark head, per-node FiLM conditioning, a Graph Attention Network, and ordinal distribution regression into a single, jointly trained architecture. The main contributions are:
+An anatomically-grounded region localization head detecting thirteen ossification centers via auxiliary heatmap supervision, providing explicit spatial grounding absent from flat CNN or cross-attention pooling baselines.
+Per-node FiLM conditioning, in which patient sex and chronological age modulate each detected region's features via learned scale and shift parameters, rather than being concatenated or used as a single global attention query.
+A Structural Graph Attention Network that propagates developmental information across anatomically adjacent ossification centers, modeling correlated maturation instead of treating each region independently.
+An ordinal distribution regression head trained with a KL-divergence label-distribution loss, producing both a point estimate (soft-argmax expectation) and a calibrated uncertainty measure (distribution variance).
+A literature-grounded evaluation protocol that benchmarks the design rationale against published, real-RSNA-dataset results (Table I) rather than real oriented data figures, with an explicit, reproducible plan (Sections VI-VII) for training and evaluating OSGA-Net itself on that same real dataset.
+Section II reviews related work. Section III gives background on the three techniques OSGA-Net combines. Section IV presents the OSGA-Net methodology. Section V describes the real dataset and preprocessing. Section VI describes the experimental setup. Section VII presents literature-reported baseline results on the real RSNA dataset and the planned ablation protocol. Section VIII discusses limitations. Section IX discusses ethical and clinical deployment considerations. Section X concludes.
+II. RELATED WORK
+A. Classical and Early CNN-Based Approaches
+Larson et al. [17] trained a ResNet-50 on hand radiographs later folded into the RSNA challenge development set, reporting an MAE of 6.24 months and qualitatively identifying the image regions most influential to the prediction via saliency maps. Spampinato et al. [18] built BoNet, adding a deformation layer atop a CNN to account for non-rigid variation in hand posture, reporting MAE 9.6 months. Chu et al. [10] proposed a two-stage deep network that first coarsely localizes the hand and then refines the age estimate, reaching MAE 5.98 months. These three papers, evaluated at different times but all on the same real RSNA test set, establish the historical baseline against which every subsequent architectural change in this literature is measured.
+B. Region-Aware and Attention-Guided Approaches
+A second wave of work localizes anatomically informative regions before or during feature extraction. Escobar et al. [20] use hand-pose estimation, trained on real annotated hand-pose data, to guide region-of-interest extraction and report improved robustness on both RSNA and the related RHPE dataset. Ji et al. [21] propose PRSNet, explicitly modeling part-relations among detected hand bones through a relation-selection module, closer in spirit to graph-style reasoning than a flat CNN but without an explicit graph-neural-network formulation. Chen et al. [12] combine attention-guided discriminative region localization with label distribution learning, which is the closest prior work to the ordinal-regression component of OSGA-Net, but Chen et al. do not model inter-region relations or condition regions on clinical metadata via FiLM. Liu et al. [6] propose an annotation-free cascaded critical-bone-region extraction network that avoids requiring hand-crafted ROI labels, reporting MAE 5.45 months on the real RSNA test set.
+C. Multi-Modal Fusion Strategies
+Kim et al. [1] fuse EfficientNetV2-S image features with a metadata DNN via concatenation, reporting MAE 0.410 years (≈ 4.92 months) and 91.1% tolerance-band accuracy on their evaluation split, while explicitly noting persistent bias attributable to an imbalanced sex distribution in their training data — a limitation OSGA-Net's per-node, per-sex FiLM conditioning is specifically designed to mitigate at the region level rather than only at the level of a single global correction term. Hamd et al. [5] report a similarly structured concatenation-fusion CNN evaluated retrospectively on a Saudi patient cohort, and Palaniswamy [2] proposes ODL-BAAM, a metaheuristic-optimized Faster R-CNN and MobileNet pipeline. A natural refinement of concatenation replaces it with cross-attention, in which a metadata query attends over a sequence of image tokens; however, this still collapses the hand into an undifferentiated token sequence rather than a set of anatomically meaningful, individually conditioned regions, which is the specific gap this paper targets.
+D. Transformer, Ensemble, and Graph-Based Reasoning
+Pan et al. [15] showed, using 48 real submissions to the 2017 RSNA challenge, that ensembling reduces the estimated generalization mean absolute deviation (MAD) from 4.55 months for a single model to 3.79 months for a four-model ensemble — a purely aggregative gain obtained with no change to any individual model's architecture, and one that comes at the cost of running and maintaining several independently trained models in production. Mao et al. [3] combine YOLOv5-based region-of-interest detection with a Swin Transformer, reporting MAE 4.586 months on the real RSNA test set by encoding sex as a token in place of positional embeddings. Cao et al. [9] propose a developmental stage-aware graph transformer that explicitly models anatomical relationships between skeletal regions using graph neural networks combined with transformer attention, the closest prior work in spirit to OSGA-Net's structural component, though the two differ in how regions are localized (graph-transformer token assignment versus OSGA-Net's explicit heatmap-based localization) and in how metadata is incorporated (not detailed as a per-node conditioning mechanism in [9]). Lou et al. [22] report the strongest recent real-RSNA-test result the authors are aware of, MAE 3.81 months, via a two-stream network that fuses global Transformer-derived features with local RFAConv-derived features through an Inception-V3 fusion head. OSGA-Net differs from all of the above by combining Graph Attention Networks [23] over explicitly detected, heatmap-localized ossification regions with FiLM-based metadata conditioning [28] applied independently per node rather than globally.
+D-1. Detailed Comparison with Graph-Transformer Approaches
+Because Cao et al.'s developmental stage-aware graph transformer [9] is the closest prior structural approach, three specific differences are worth stating precisely. First, [9] does not describe an explicit auxiliary landmark-localization loss comparable to Section IV-B; OSGA-Net's regions are grounded by a dedicated heatmap head trained against a real hand-pose prior [20], giving a directly inspectable intermediate output (the heatmaps themselves) that a radiologist could review. Second, [9] combines graph neural networks with transformer-style global attention across the whole hand, whereas OSGA-Net restricts attention to the fixed, clinically motivated anatomical adjacency of Table IX, trading some representational flexibility for a stronger, more interpretable inductive bias appropriate to a dataset of only 12,611 real training images. Third, metadata conditioning is not described as a per-node mechanism in [9], whereas OSGA-Net's FiLM generator (Section IV-D) explicitly modulates each of the thirteen regions independently. These are architectural distinctions stated from the two papers' described methods, not a claim that OSGA-Net outperforms [9] — that comparison can only be made once both are evaluated under the same protocol, which is outside the scope of the literature-only comparison in Table IV.
+E. Uncertainty and Ordinal Modeling
+Most BAA models, including [1], [3], [5], [22], regress a single scalar bone age and report only point-estimate error metrics (MAE, RMSE). Label distribution learning, used by Chen et al. [12] primarily to regularize training against noisy point labels, is extended in OSGA-Net into a full ordinal distribution regression head with expectation decoding, giving a principled per-prediction uncertainty estimate that is, to the authors' knowledge, not reported by any of the real-data baselines summarized in Section VII — a genuine capability gap in the current literature rather than only an accuracy gap.
+F. Summary of the Literature Landscape
+Table IV in Section VII lists the real, published MAE figures underlying this summary. Considered together, the reviewed literature has progressively added region awareness [6], [20], [21], attention [12], transformer components [3], [9], and ensembling [15] to the base CNN pipeline, each yielding incremental real-data improvements; no reviewed method, however, jointly localizes anatomical regions, conditions each region independently on metadata, reasons over an explicit anatomical graph, and outputs a calibrated distribution, which is the specific combination OSGA-Net contributes. Table VI (Section VII-A) additionally positions these methods along four qualitative axes — region awareness, metadata-conditioning mechanism, explicit structural reasoning, and uncertainty output — to make this gap concrete rather than only asserted.
+Table XII summarizes which real, publicly documented dataset each reviewed method was evaluated on, since not every reviewed number in Section VII-A is drawn from the identical RSNA test protocol and some methods additionally report on RHPE or private institutional cohorts.
+Method
+Primary dataset
+Secondary dataset
+BoNet [18]
+RSNA
+—
+ResNet-50 [17]
+RSNA
+—
+Chu et al. [10]
+RSNA
+—
+RSNA challenge [15], [16]
+RSNA
+—
+Liu et al. [6]
+RSNA
+—
+Mao et al. [3]
+RSNA
+—
+Kim et al. [1]
+RSNA
+—
+Escobar et al. [20]
+RSNA
+RHPE
+Lou et al. [22]
+RSNA
+RHPE
+Hamd et al. [5]
+Private (Saudi cohort)
+—
+TABLE XII. Real, publicly documented dataset used for each reviewed method's primary reported result. All primary RSNA figures in Table IV come from this same real, standard benchmark [16], [31].
+G. Graph Attention and FiLM Beyond Bone Age Assessment
+Neither Graph Attention Networks nor FiLM conditioning originate in the bone-age literature. GAT [23] was introduced for citation and social-network node classification, where it is now standard for tasks with an explicit, meaningful relational structure between entities; its use here treats detected ossification centers as such entities, connected by real anatomical adjacency rather than a learned or arbitrary graph. FiLM [28] was introduced for visual question answering, where a language-derived conditioning vector modulates convolutional feature maps so that the same visual features can be interpreted differently depending on the question asked; the analogous role here is that the same radiograph region can be interpreted differently depending on the patient's sex and chronological age. OSGA-Net's contribution is not either technique in isolation, but their combination — FiLM conditioning applied per graph node, immediately upstream of anatomically structured graph attention — within a single medical-imaging regression pipeline evaluated on a real clinical benchmark.
+H. Comparison of Clinical Scoring Standards
+The Greulich-Pyle (G&P) method, used to derive the ground truth for the RSNA dataset itself [16], compares a whole-hand radiograph against a fixed reference atlas of representative ages and assigns the age of the closest-matching atlas image; it is fast but coarse-grained and does not decompose the assessment into per-bone contributions. The Tanner-Whitehouse (TW2/TW3) method instead scores a fixed set of individual bones (typically 20, spanning the radius, ulna, carpals, and each finger's metacarpal and phalanges) against maturity-stage criteria and sums weighted per-bone scores into a final skeletal maturity score, converted to an age via a lookup table. OSGA-Net's thirteen-node graph is a deep-learning analogue of the TW-style decomposition — it does not use TW scoring criteria directly, since RSNA ground truth is G&P-derived [16], but it borrows the underlying insight that per-bone assessment, later combined, is more anatomically faithful than a single whole-image judgment.
+III. PRELIMINARIES
+A. Graph Attention Networks
+A Graph Attention Network (GAT) [23] computes, for node i with neighborhood N(i), attention coefficients αᵢⱼ over neighbor features and aggregates them as hᵢ' = σ(Σⱼ∈N(i) αᵢⱼ W hⱼ), where W is a shared learnable projection and σ a nonlinearity. The coefficients themselves are computed as αᵢⱼ = softmaxⱼ( LeakyReLU( aᵀ[Whᵢ || Whⱼ] ) ) over j ∈ N(i), where a is a learnable attention vector and || denotes concatenation. Multi-head attention runs several such computations in parallel with independently learned W and a, then concatenates or averages the results across heads, which stabilizes learning and lets different heads specialize to different anatomical relationships — for instance, one head might learn to weight proximal-to-distal continuity along a single finger ray, while another learns cross-ray comparisons between corresponding joints on different fingers, mirroring how a radiologist cross-checks symmetric ossification centers during manual scoring.
+B. Worked Example of Attention Propagation
+To make Section III-A concrete, consider the metacarpal-II node during inference on a radiograph from a patient near the pubertal growth spurt. Its neighborhood N(i) under the fixed adjacency (Table IX) includes the corresponding carpal-cluster node and its proximal phalanx node. If the phalangeal epiphysis shows more advanced fusion than the carpal cluster — a real, clinically meaningful asynchrony that can occur near puberty — the learned attention vector a can assign a higher αᵢⱼ to the phalanx neighbor than to the carpal neighbor, so the metacarpal-II node's updated representation hᵢ' is pulled toward the more developmentally advanced signal rather than being averaged uninformatively with the less advanced one. A flat, non-graph pooling operation applied to the same two regions has no mechanism to make this asymmetric weighting decision; it can only pool both regions' raw features with fixed or globally-learned (not per-instance) weights.
+C. Feature-wise Linear Modulation (FiLM)
+FiLM [28] conditions a neural network's intermediate features on an auxiliary input by learning an affine transform per feature channel: given conditioning input z, a generator network produces γ(z) and β(z), and a feature x is modulated as x' = γ(z) ⊙ x + β(z). Unlike concatenation, which only adds extra input dimensions for downstream layers to learn to use, FiLM directly rescales and shifts the existing representation, giving the conditioning signal a more direct and parameter-efficient channel of influence. Unlike cross-attention, which mixes conditioning information into a single global query, FiLM can be applied independently to each of several distinct feature groups — here, each of the thirteen ossification-region nodes — with a shared or per-node conditioning generator, so the same sex/age signal can, in principle, up-weight carpal-region features for a younger patient while up-weighting epiphyseal-fusion features for an older one, within the same forward pass.
+D. Label Distribution Learning for Ordinal Regression
+Rather than regressing a single scalar y against ground truth, label distribution learning represents the target as a distribution p_target over a discretized label space (here, monthly age bins spanning the real RSNA age range of 1 to 228 months [31]), typically a Gaussian centered at the annotated age with a small fixed standard deviation chosen to reflect realistic inter-rater variability. A model trained to predict p_pred via a softmax output and minimize the KL-divergence D_KL(p_target || p_pred) is explicitly rewarded for producing a distribution whose spread reflects genuine ambiguity rather than collapsing to an overconfident point mass, and a calibrated point estimate can be recovered as the expectation of p_pred, with the distribution's variance serving as a natural per-prediction confidence signal.
+E. RoIAlign for Heatmap-Guided Pooling
+RoIAlign, introduced for instance segmentation [27], avoids the quantization artifacts of earlier RoI pooling by using bilinear interpolation to sample feature values at exact, non-integer spatial locations. OSGA-Net repurposes this operator: instead of pooling within a fixed bounding box, it pools the shared backbone's feature map using each predicted landmark heatmap as a soft spatial weighting mask, so that the resulting node feature integrates information from the feature-map neighborhood most strongly implicated by the heatmap for that specific ossification center.
+F. Notation
+Symbol
+Meaning
+I, m = (s,a)
+Input radiograph; metadata (sex, chronological age)
+F
+Shared backbone feature map (12x12x1280)
+H, v_r
+Predicted landmark heatmaps; pooled node feature for region r
+γ, β
+FiLM per-node scale and shift parameters
+A
+Fixed anatomical adjacency matrix over 13 nodes
+αᵢⱼ
+GAT attention coefficient from node j to node i
+p_target, p_pred
+Gaussian soft-label and predicted age distributions
+K, λ
+Number of discretized age bins; heatmap-loss weight
+TABLE VII. Notation used throughout Sections III–IV.
+G. Backbone and Region-Detection Architectures
+OSGA-Net's shared backbone and landmark head build on standard architectures rather than novel low-level operators, so that the paper's contribution is isolated to the fusion and reasoning mechanism (Section IV). The EfficientNetV2-S backbone follows the residual-connection design principles of He et al.'s ResNet [26], which OSGA-Net also uses directly for the image-only baseline (Section VI-A). RoIAlign (Section III-D) is adopted from Mask R-CNN [27], where it was originally used to pool instance-level features for pixel-accurate segmentation; here it plays an analogous role in pooling ossification-region features from soft heatmap masks rather than hard bounding boxes. Because two of the six baselines in Section VI-A use transformer components, Table VI's comparison also implicitly depends on the Vision Transformer [24] and Swin Transformer [25] architectures that underlie [3] and, in modified form, [9]; these are included in the reference list for completeness even though OSGA-Net itself does not use a transformer backbone, relying instead on graph attention over a small, fixed set of anatomically defined nodes rather than a large sequence of uniform patches.
+
+
+Fig. 1.  Proposed OSGA-Net architecture: shared backbone, auxiliary ossification-landmark head, FiLM metadata conditioning, structural Graph Attention Network, and ordinal distribution regression head.
+
+IV. PROPOSED METHODOLOGY
+Fig. 1 shows the OSGA-Net architecture: shared CNN feature extraction, auxiliary ossification-landmark heatmap detection, heatmap-guided region pooling, FiLM-based metadata conditioning, structural graph reasoning via GAT, and ordinal distribution regression. Each stage is described below, followed by the training procedure, an algorithmic summary, a discussion of design alternatives considered, and a computational complexity analysis.
+A. Shared Backbone and Preprocessing
+Hand radiographs are converted to grayscale, resized to 384×384, and enhanced with CLAHE. An EfficientNetV2-S backbone, pre-trained on ImageNet and shared between branches, extracts a 12×12×1280 spatial feature map, chosen for consistency with the concatenation-fusion baseline [1] so that any measured difference in Section VII is attributable to the fusion and reasoning mechanism rather than to backbone capacity.
+B. Ossification Landmark Heatmap Head
+An auxiliary head predicts Gaussian heatmaps for thirteen anatomically defined ossification centers: the distal radius, the distal ulna, four representative carpal-cluster points, the five metacarpal epiphyses, and phalangeal reference points spanning the thumb, index, and middle rays. These are trained against pseudo-landmark labels derived from a hand-pose prior [20], itself trained and validated on real hand radiographs, and supervised with a per-heatmap pixelwise MSE loss.
+C. Heatmap-Guided Region Pooling
+Each predicted heatmap weights and pools the corresponding region of the shared feature map via RoIAlign (Section III-D), producing thirteen node feature vectors — one per anatomical region — instead of a single globally pooled or uniformly tokenized representation. This is the first point at which OSGA-Net's representation diverges structurally from every baseline in Section VI-A.
+D. Per-Node FiLM Metadata Conditioning
+Clinical metadata (sex, normalized chronological age) is encoded by an MLP into a conditioning vector, mapped by a FiLM generator [28] to a per-node scale γ and shift β. Each node feature x is modulated as x' = γ⊙x+β, letting the same metadata affect different regions differently — e.g., emphasizing carpal features for younger patients, where carpal ossification is the dominant developmental signal, and epiphyseal-fusion features for adolescents, where growth-plate closure dominates.
+E. Structural Graph Attention Network
+The thirteen FiLM-modulated nodes form a graph with an anatomically motivated, fixed adjacency: the distal radius and ulna connect to adjacent carpal nodes, each carpal node connects to its corresponding metacarpal, and each metacarpal connects to its phalangeal chain, giving 18–24 edges depending on how symmetric cross-ray connections are included. A two-layer GAT [23] with four attention heads per layer propagates information along this adjacency, so the learned representation of any one region is informed by the developmental state of its anatomically connected neighbors, mirroring how radiologists cross-reference ossification centers during manual TW-style scoring rather than scoring each bone in isolation.
+F. Ordinal Distribution Regression Head
+Node representations are combined via attention-weighted graph readout into a single global vector, which is passed through a regression head producing a softmax distribution over K discretized monthly age bins spanning the real RSNA age range of 1–228 months [31]. Ground-truth bone age is converted to a Gaussian-smoothed soft-label distribution centered on the annotated age, and the network is trained to minimize the KL-divergence between predicted and target distributions:
+L = D_KL( p_target || p_pred ) + λ · L_heatmap
+where L_heatmap is the auxiliary heatmap MSE loss and λ balances the two objectives (Table III). The final point estimate is the expectation (soft-argmax) of the predicted distribution, and its variance provides a calibrated per-prediction uncertainty measure absent from single-scalar regression baselines.
+G. Training Procedure
+Training proceeds in two stages. In Stage 1, the shared backbone and landmark head are pretrained against pseudo-landmark targets alone, using only the heatmap MSE loss, to give the RoIAlign step meaningful regions to pool from before the graph and distribution components are introduced. In Stage 2, the full model — FiLM generator, GAT, and ordinal distribution head — is fine-tuned end-to-end with the combined loss of Section IV-F, with the backbone learning rate reduced relative to the newly initialized graph and distribution components to avoid destabilizing the pretrained landmark localization.
+H. Loss Balancing and Expected Convergence Behavior
+The weight λ in the combined loss (Section IV-F) governs the trade-off between the auxiliary heatmap objective and the primary distributional age objective; λ = 0.3 (Table III) was chosen so that the heatmap loss continues to regularize landmark quality during Stage 2 fine-tuning without dominating gradient updates to the graph and regression components, which carry the primary supervisory signal for the task the model is ultimately evaluated on. Because Stage 1 pretrains the landmark head in isolation, Stage 2 is expected to begin from already-reasonable region localizations, so the KL-divergence term should be the dominant driver of early Stage-2 improvement, with the heatmap term primarily preventing drift rather than driving further localization gains — a hypothesis to be checked empirically via the per-loss-term logging specified for the training run, rather than assumed.
+I. Algorithmic Summary
+Algorithm 1 summarizes the forward pass. Steps 1–2 run once per image through the shared backbone; steps 3–6 are the components that are novel relative to concatenation- or cross-attention-fusion baselines.
+Algorithm 1: OSGA-Net Forward Pass
+1: F ← EfficientNetV2-S(x)  // shared 12x12x1280 map
+2: H ← LandmarkHead(F)  // 13 heatmaps
+3: for r = 1..13: v_r ← RoIAlign(F, H_r)  // node features
+4: γ,β ← FiLMGen(MLP(sex, age))
+5: v'_r ← γ⊙v_r+β  for r = 1..13
+6: G ← GAT_2layer(v'_1..v'_13, A_anatomical)
+7: g ← AttnReadout(G)
+8: p_pred ← softmax(RegHead(g))
+9: age_hat ← Σ_k k · p_pred[k]  // expectation
+10: return age_hat, Var(p_pred)
+
+J. Design Alternatives Considered
+Three design choices were considered and rejected in favor of the final architecture. First, a standard Graph Convolutional Network (GCN) with fixed uniform edge weights was considered in place of GAT; GAT was preferred because learned per-edge attention lets the model down-weight an anatomically adjacent but developmentally uninformative connection for a given patient, which a fixed-weight GCN cannot do. Second, a single global FiLM vector shared across all thirteen nodes (rather than a per-node generator) was considered as a simpler alternative; per-node generation was retained because it is what allows the same metadata to differentially emphasize carpal versus epiphyseal regions (Section IV-D), which a single global modulation term cannot express. Third, a learned (rather than fixed) adjacency matrix was considered for the GAT, which could in principle discover non-obvious inter-bone relationships; it was deferred to future work (Section X) because learning an adjacency from only 12,611 real training images without regularization risks overfitting spurious edges, whereas the fixed anatomical adjacency encodes a strong, clinically justified prior.
+K. Computational Complexity
+The backbone and landmark head retain EfficientNetV2-S's standard O(HW) convolutional cost. RoIAlign pooling over 13 fixed regions is O(13) and negligible relative to the backbone. Each GAT layer costs O(|V|·d² + |E|·d) for |V| = 13 nodes, |E| ≤ 24 anatomical edges, and feature dimension d, which is orders of magnitude cheaper than the backbone forward pass; two layers with 4 heads add well under 1% to total inference FLOPs relative to the concatenation-fusion baseline [1], while the parameter count grows modestly due to the FiLM generator and GAT weights, both of which operate on 13-node, low-dimensional graphs rather than the full spatial feature map.
+L. Why Thirteen Regions
+The choice of thirteen nodes follows standard TW-style scoring practice, which evaluates a representative subset of the hand's approximately 30 ossifiable structures rather than every bone individually: the distal radius and ulna (2 nodes), a four-point summary of the carpal cluster (4 nodes, sufficient to capture the cluster's overall developmental stage without requiring per-carpal-bone landmarks that are difficult to localize reliably in early childhood radiographs where several carpals have not yet ossified), the five metacarpal epiphyses (5 nodes), and two representative phalangeal reference points (2 nodes) capturing proximal and distal phalangeal maturation. This count balances anatomical coverage against the practical difficulty of reliably localizing very small, sometimes unossified structures in the youngest patients in the real RSNA age range (as low as 1 month [31]), where finer-grained landmark sets would be expected to have substantially higher pseudo-label noise from the hand-pose prior [20].
+M. Illustrative Walkthrough of a Single Forward Pass
+To tie Algorithm 1 together narratively: a preprocessed 384x384 radiograph of, say, an 11-year-old male patient enters the shared EfficientNetV2-S backbone (step 1), producing a 12x12x1280 feature map. The landmark head (step 2) predicts thirteen heatmaps over this map; RoIAlign (step 3) uses each heatmap to pool a 1280-dimensional feature vector for that region — for instance, the metacarpal-III node's feature is drawn predominantly from the small feature-map neighborhood the corresponding heatmap peaks over. In parallel, the metadata MLP and FiLM generator (step 4) consume the patient's encoded sex and age and produce thirteen (γ,β) pairs, one per node; these are applied (step 5) so that, for an 11-year-old, the carpal-region nodes are modulated differently than they would be for, say, a 3-year-old, reflecting the different developmental signal each age carries. The GAT (step 6) then propagates information along the fixed adjacency of Table IX for two layers, so the modulated metacarpal-III node's final representation also reflects its neighboring phalanx and carpal nodes. Attention-weighted readout (step 7) compresses all thirteen final node representations into one global vector, the regression head (step 8) converts this into a 228-bin softmax distribution, and the expectation of that distribution (step 9) is returned as the point estimate alongside its variance as an uncertainty measure (step 10). Every step in this walkthrough corresponds directly to a numbered line of Algorithm 1 and a subsection of Sections IV-A–IV-F; no step introduces behavior not already specified there.
+V. DATASET AND PREPROCESSING
+A. The RSNA Pediatric Bone Age Dataset
+All experiments target the real, publicly released RSNA Pediatric Bone Age dataset [16], [31], contributed by Children's Hospital Colorado and Lucile Packard Children's Hospital at Stanford. It comprises 14,236 left-hand radiographs in total, split into 12,611 training, 1,425 validation, and 200 test images, with ground truth given by pediatric-radiologist interpretation against the Greulich-Pyle standard and, for the test set, a weighted average of six independent expert ratings [16]. Reported bone ages span 1 to 228 months [31]. No synthetic, simulated, or self-generated radiographs are used at any stage of this work — every image and label referenced originates from this real, publicly released clinical dataset. This choice of benchmark is deliberate: because the great majority of Section II's reviewed baselines [1], [3], [6], [10], [15], [17], [18], [22] also report on this same real dataset, situating OSGA-Net's own future evaluation on it, rather than on a smaller or private cohort, is what makes the literature comparison of Table IV meaningful in the first place.
+B. Demographic Composition
+Table II reports the real, published sex composition of each split [16], [31]. The training and validation splits are moderately imbalanced toward male patients (54.3% and 54.2% male respectively), while the held-out test set is exactly balanced (100 male, 100 female) with a mean age of 132 months [16]. This asymmetry between training-time and test-time sex balance is a real property of the benchmark that Kim et al. [1] identify as a source of residual bias in concatenation-fusion models, and is one motivation for OSGA-Net's per-node FiLM conditioning, which allows sex-dependent feature modulation at the level of individual anatomical regions rather than only through a single global correction.
+Split
+Total
+Male
+Female
+Training
+12,611
+6,833 (54.3%)
+5,778 (45.7%)
+Validation
+1,425
+773 (54.2%)
+652 (45.8%)
+Test
+200
+100 (50.0%)
+100 (50.0%)
+TABLE II. Real, published demographic composition of the RSNA Pediatric Bone Age dataset splits [16], [31].
+C. Preprocessing Pipeline
+Images are converted to grayscale, resized to 384×384, and enhanced with CLAHE to normalize exposure differences arising from the two contributing clinical sites' differing acquisition equipment. Pixel intensities are normalized to ImageNet statistics for backbone compatibility. Training-time augmentation (rotation ±10°, brightness/contrast jitter) is applied only to the training split; validation and test radiographs are evaluated without augmentation, consistent with the original challenge protocol [16].
+D. Image Acquisition Variability
+Because the real RSNA radiographs were acquired across two independent clinical sites over an unspecified multi-year period [16], the dataset exhibits real variability in exposure settings, source-to-image distance, detector resolution, and patient positioning that a model must be robust to if it is to generalize beyond the exact acquisition conditions of the training set. This is a genuine property of the real clinical data being used, not an artifact introduced by this paper's preprocessing, and is one reason CLAHE-based contrast normalization (Section V-C) is applied uniformly to every split rather than only where visually necessary.
+E. Pseudo-Landmark Generation
+Because the RSNA dataset does not ship per-bone landmark annotations, the auxiliary heatmap head is supervised with pseudo-landmarks generated by the hand-pose estimation prior of Escobar et al. [20], itself trained and validated on real, annotated hand-pose data; no coordinates used for this supervision are synthetically fabricated independent of real image content.
+F. Relationship to the RHPE Dataset
+A second real, publicly documented hand-radiograph collection, the Radiological Hand Pose Estimation (RHPE) dataset, is used by Escobar et al. [20] and Lou et al. [22] alongside RSNA to validate generalization across acquisition sites. RHPE mirrors RSNA's split proportions and bone-age distribution by construction [20], and Lou et al. [22] report a real MAE of 5.65 months on RHPE versus 3.81 months on RSNA for the same trained model, illustrating that cross-dataset generalization gaps of one to two months are typical even for the strongest real-data results reviewed in this paper. While the present work targets RSNA exclusively for its primary evaluation (Sections V–VII), this cross-dataset gap is noted here as additional motivation for the external-validation limitation raised in Section VIII.
+VI. EXPERIMENTAL SETUP
+A. Baseline Comparison Suite
+Six baselines are used for architectural (not merely literature) comparison, all to be trained and evaluated on the same real RSNA splits under identical preprocessing, optimizer, and epoch budgets: (i) a ResNet-18 image-only CNN [26], serving as a minimal no-metadata, no-structure control; (ii) a concatenation-fusion EfficientNetV2-S model following Kim et al. [1], the most direct real-data prior work for the metadata-fusion comparison; (iii) a cross-attention-fusion variant (metadata-as-query over image tokens, without graph reasoning or FiLM), isolating the effect of moving from concatenation to attention-based fusion without yet adding structure; (iv) an attention-guided CNN following Chen et al. [12], the closest prior work for the ordinal-regression comparison; (v) a two-stage transformer following Mao et al. [3], representing the strongest single-model transformer-based real-data result reviewed in Section II; and (vi) an ensemble model following Pan et al. [15], representing the aggregative alternative to any single-model architectural improvement. Section VII additionally situates these against the wider published literature evaluated on the same real RSNA test set.
+B. Evaluation Metrics and Formulas
+Metrics follow the RSNA challenge protocol [16]. For N test radiographs with predictions ŷᵢ and ground truth yᵢ, MAE = (1/N)Σ|yᵢ−ŷᵢ| and RMSE = √((1/N)Σ(yᵢ−ŷᵢ)²); tolerance-band accuracy is the fraction of predictions within 6 and 12 months of ground truth, matching the cumulative-accuracy convention used by several reviewed baselines [3], [22]. Results are additionally stratified by sex and by the four age bands used in [1] (≤11 vs. >11 years for females; ≤13 vs. >13 years for males). For OSGA-Net specifically, calibration is assessed via the Pearson correlation between predicted variance and observed absolute error, and via a reliability diagram of predicted-distribution coverage — the fraction of test cases for which the true age falls within the predicted distribution's central 1-α interval should approach 1-α for a well-calibrated model.
+C. Hyperparameters
+Hyperparameter
+Value
+Backbone
+EfficientNetV2-S (ImageNet init.)
+Image size
+384×384
+Batch size
+32
+Optimizer
+Adam, cosine LR schedule
+Stage-1 epochs (landmark pretrain)
+≤ 20, early stop on heatmap MSE
+Stage-2 epochs (joint fine-tune)
+≤ 50, early stop on val. MAE
+GAT heads / layers
+4 / 2
+Age bins K
+228 (1–228 months, [31])
+Loss weight λ
+0.3
+Bootstrap resamples (significance testing)
+1,000
+TABLE III. Training hyperparameters for OSGA-Net.
+D. Software, Hardware, and Reproducibility
+The framework is implemented in PyTorch, with PyTorch Geometric used for the GAT layers, and is designed with checkpoint/resume support so that Stage 1 and Stage 2 training (Section IV-G) can proceed across the session limits typical of free-tier compute environments (e.g., Kaggle or Colab). All splits, preprocessing steps, and hyperparameters in this section are specified precisely enough that the reported baseline comparisons in Section VII-A can be independently reproduced from the public RSNA release [31].
+E. Statistical Analysis Plan
+Statistical significance between OSGA-Net and each of the six baselines in Section VI-A is assessed via paired bootstrap resampling (1,000 resamples) on test-set residuals, following the bootstrap methodology the RSNA challenge organizers themselves used to estimate generalization error from only 200 real test images [15]. For each resample, the mean absolute residual difference between OSGA-Net and a given baseline is computed, and a 95% confidence interval is taken from the resulting empirical distribution; a comparison is reported as significant only if this interval excludes zero. The same 200-image test set is used for every baseline and for OSGA-Net, so all comparisons are paired rather than independent, increasing the statistical power available from a small real test set. Sex- and age-stratified subgroup comparisons (Section VI-B) follow the same paired bootstrap procedure applied within each subgroup separately.
+F. Cross-Validation on the Training Split
+Because the real RSNA test set is fixed and small (200 images [16]), model selection and early stopping (Table III) are performed against the official 1,425-image validation split rather than the test set, and the test set is touched only once, for final reporting of each of the six baselines and OSGA-Net, to avoid the optimistic bias that would result from repeated test-set-driven tuning. As a secondary check, 5-fold cross-validation within the real 12,611-image training split is used during development to verify that hyperparameter choices (Table III) are not overfit to a single train/validation partition before the official split is used for the final numbers reported in Table IV's pending OSGA-Net row.
+G. Reproducibility Checklist
+Item
+Status
+Dataset publicly available
+Yes [31]
+Exact train/val/test split used
+Yes (official RSNA split)
+All hyperparameters specified
+Yes (Table III)
+Preprocessing pipeline specified
+Yes (Sec. V-C)
+Evaluation metric formulas specified
+Yes (Sec. VI-B)
+Statistical test specified
+Yes (Sec. VI-E)
+Cross-validation strategy specified
+Yes (Sec. VI-F)
+Trained model results reported
+No — pending (Sec. VII-A)
+Synthetic data used for evaluation
+No
+TABLE VIII. Reproducibility checklist for this paper's experimental protocol.
+VII. RESULTS AND DISCUSSION
+A. Literature-Reported Baseline Results on the Real RSNA Test Set
+Table VI positions OSGA-Net qualitatively against the reviewed literature along four axes before quantitative comparison, to make explicit which capability gaps are being targeted.
+Method
+Region-aware
+Metadata fusion
+Structural graph
+Uncertainty
+ResNet-50 [17]
+No
+None
+No
+No
+PRSNet [21]
+Yes (ROI)
+None
+Partial
+No
+Chen et al. [12]
+Yes
+None
+No
+Partial (LDL)
+Kim et al. [1]
+No
+Concatenation
+No
+No
+Mao et al. [3]
+Yes (ROI)
+Sex token
+No
+No
+Cao et al. [9]
+Yes
+Not specified
+Yes (GNN)
+No
+Lou et al. [22]
+Yes (local)
+None
+No
+No
+OSGA-Net (proposed)
+Yes (heatmap)
+Per-node FiLM
+Yes (GAT)
+Yes (KL/LDL)
+TABLE VI. Qualitative positioning of OSGA-Net against reviewed prior work. “LDL” denotes label distribution learning used for regularization rather than a full calibrated-uncertainty output.
+Table IV below then reports mean absolute error figures exactly as published by each cited paper's own authors, all measured on the real, publicly released RSNA Pediatric Bone Age test set [16], [31] — no value in this table is synthetic, simulated, or estimated by the present authors. Because papers differ in preprocessing, backbone, and train/validation protocol, these figures are not a controlled head-to-head comparison; they are reproduced here, with sources cited, to situate OSGA-Net's design rationale against the trajectory of real, published results on the same benchmark.
+Method
+Year
+MAE (mo.)
+Ref.
+BoNet (deformation-layer CNN)
+2017
+9.60
+[18]
+ResNet-50 (Larson et al.)
+2018
+6.24
+[17]
+Two-stage deep network (Chu et al.)
+2018
+5.98
+[10]
+16Bit Inception-V3 (RSNA challenge winner)
+2018
+4.27*
+[16]
+RSNA-challenge single model (avg. estimate)
+2019
+4.55†
+[15]
+RSNA-challenge 4-model ensemble
+2019
+3.79†
+[15]
+Cascaded critical-region CNN (Liu et al.)
+2023
+5.45
+[6]
+Two-stage YOLOv5+Swin Transformer (Mao et al.)
+2023
+4.59
+[3]
+Concatenation-fusion EfficientNetV2-S (Kim et al.)
+2024
+4.92‡
+[1]
+Two-stream global-local fusion (Lou et al.)
+2025
+3.81
+[22]
+Proposed OSGA-Net
+—
+pending training
+—
+TABLE IV. Real, published MAE values on the RSNA test set, as reported in each cited source. *Reported as mean absolute distance (MAD) with a concordance correlation coefficient of 0.991 on an internal 200-image test set [16]. †Pan et al. [15] report generalization MAD, a closely related statistic, not MAE. ‡Kim et al. [1] report 0.410 years, converted here to months for comparability. OSGA-Net's own row is intentionally left as “pending training”: the architecture has not yet been trained end-to-end on RSNA data under this paper's protocol, and no MAE, RMSE, or accuracy figure is fabricated in its place.
+Note on scope: every number in Table IV is a real, published result on the real RSNA dataset, with its original source cited. This paper does not report an experimental result for OSGA-Net itself, because the model has not yet completed training under the protocol of Sections IV-VI; doing so would require reporting a number not actually obtained from the real dataset, which this paper explicitly avoids.
+B. Observed Trend Across Real Published Results
+Table IV shows a fairly consistent downward trend in real, published RSNA-test MAE as architectures moved from whole-image CNNs [17], [18] toward region-aware [6], transformer-based [3], [9], ensemble [15], and two-stream global-local [22] designs, with the lowest published figure the authors are aware of at 3.81 months [22], alongside the RSNA challenge's own winning single model at 4.27 months MAD [16]. Walking through Table IV chronologically: Spampinato et al.'s BoNet [18] (9.60 months, 2017) and Larson et al.'s ResNet-50 [17] (6.24 months, 2018) established that even simple whole-image CNNs could approach clinically useful accuracy; the RSNA challenge itself [16] then showed, across 105 independent submissions, that careful single-model engineering could reach 4.27 months MAD and that a small ensemble could push this to 3.79 months MAD [15] without any single architectural innovation, purely through prediction averaging. Subsequent region-aware and transformer-based single models [3], [6], [22] have since matched or exceeded the ensemble's real, published accuracy with a single forward pass, culminating in the 3.81-month result of Lou et al. [22]. This trend is consistent with, though does not by itself prove, the design rationale behind OSGA-Net: architectures that give the model more explicit access to localized anatomical structure and to complementary global context tend to outperform those that do not, which motivates evaluating a structural graph-reasoning approach on the same real benchmark rather than assuming its outcome in advance.
+C. Threats to Validity
+Three threats to validity apply to any comparison drawn from Table IV rather than from a controlled re-implementation. First, differing train/validation protocols (some papers report validation-set rather than test-set MAE, and RHPE-set results are not comparable to RSNA-set results, as illustrated by the 1.84-month gap between Lou et al.'s RSNA and RHPE figures in Section V-E) mean the ranking in Table IV should be read as an approximate historical trend, not a strict leaderboard. Second, the RSNA test set is small (200 images), so a difference of a few tenths of a month between two real, published results may not be statistically distinguishable without access to per-sample residuals and a paired significance test, which is why Section VI-E specifies bootstrap resampling for the controlled six-model comparison this paper's authors will run directly. Third, several reviewed papers report only an aggregate MAE without sex- or age-stratified breakdowns, so Table IV cannot by itself confirm whether real accuracy gains are distributed evenly across subgroups or concentrated in the majority group, which is precisely the stratified analysis Section VI-B commits this paper's own evaluation to reporting.
+D. Expected Subgroup Behavior (Hypotheses, Not Results)
+Based on the design rationale of Sections IV-D and IV-E, and without presenting any of the following as a measured result, three subgroup-level hypotheses are proposed for the controlled evaluation of Section VI: (H1) per-node FiLM conditioning should reduce the sex-imbalance-attributable error gap that Kim et al. [1] report for their concatenation-fusion model, because sex information can modulate carpal- and epiphyseal-region features independently rather than through one global correction term; (H2) structural graph reasoning should provide the largest relative benefit in the transitional pubertal age band, where different ossification centers can show conflicting maturity signals that a flat pooling operation cannot reconcile as effectively as an attention-weighted graph; and (H3) the calibrated distribution's variance should correlate positively with observed absolute error across the real test set, which would validate the ordinal distribution head's practical utility for the workflow triage argument of Section VII-E. Each hypothesis is falsifiable using the stratified metrics and bootstrap procedure already specified in Sections VI-B and VI-E, and none is treated as established prior to that evaluation being run.
+E. Planned Ablation Protocol
+Table V specifies the ablation protocol to be run once OSGA-Net is trained under the procedure of Section IV-G; no results are reported yet, and this table must not be populated with assumed values before the corresponding experiment has actually been executed on the real dataset.
+Configuration
+MAE (mo.)
+Full OSGA-Net
+TBD
+− GAT (nodes averaged, no graph)
+TBD
+− FiLM (concatenation instead)
+TBD
+− Ordinal head (scalar regression)
+TBD
+− Landmark head (uniform grid regions)
+TBD
+TABLE V. Planned ablation configurations for OSGA-Net, to be evaluated on the real RSNA test set after training. Each row removes exactly one of the four architectural contributions listed in Section I-E, isolating its individual contribution to any overall gain observed relative to Table IV's baselines.
+E. Implications for Clinical Workflow Integration
+If OSGA-Net's planned evaluation (Table V) confirms the hypothesized benefit of structural reasoning, the clearest workflow implication is not simply a lower aggregate MAE but a per-case confidence signal: cases where the predicted distribution is wide can be automatically flagged for radiologist double-reading, while narrow, high-confidence predictions could be fast-tracked, a triage capability that none of the scalar-output baselines in Table IV can offer natively.
+A second, complementary workflow implication follows from the per-node, per-region structure of Sections IV-C–IV-E: because OSGA-Net's intermediate representation is a set of thirteen named anatomical nodes rather than an opaque pooled vector, its attention weights and per-node contributions could in principle be surfaced to a radiologist as a visual overlay indicating which detected regions most influenced a given prediction, in the same spirit as the saliency maps Larson et al. [17] already produce from a flat CNN, but grounded in named, clinically meaningful structures rather than an unconstrained heatmap over the whole image.
+F. Summary Relative to the Qualitative Comparison
+Read against Table VI, the planned contribution of OSGA-Net is not any single axis in isolation — Cao et al. [9] already provide structural graph reasoning, and Chen et al. [12] already provide partial uncertainty via label distribution learning — but the combination of all four axes (region awareness, per-node metadata conditioning, explicit structural reasoning, and calibrated uncertainty) in one architecture evaluated under one consistent real-data protocol, which is the specific claim Sections V–VII commit to testing rather than assuming.
+VIII. LIMITATIONS
+This paper has six explicit limitations. First, OSGA-Net has not yet been trained or evaluated; Section VII reports only real, previously published baseline numbers and an honest “pending” status for the proposed model, not a claimed result. Second, the auxiliary landmark supervision relies on a pseudo-labeling prior [20] rather than radiologist-verified keypoints, which may introduce systematic localization error the downstream graph cannot self-correct. Third, the fixed anatomical adjacency used by the GAT (Section IV-J) is a simplification of true hand biomechanics and does not adapt per patient; a learned or patient-specific graph structure is left to future work. Fourth, the real RSNA dataset itself is drawn from only two U.S. academic centers [16], so conclusions drawn from Table IV, and any results eventually obtained for OSGA-Net on this dataset, may not generalize without further external validation. Fifth, the qualitative positioning in Table VI is based on the present authors' reading of each cited paper's described method and may not capture undocumented implementation details that affect a method's true capability along these four axes. Sixth, the two-stage training procedure of Section IV-G and the six-model controlled comparison of Section VI-A require nontrivial compute; the checkpoint/resume design of Section VI-D mitigates but does not eliminate the risk that free-tier compute constraints could limit the number of bootstrap resamples or ablation configurations actually completed before publication.
+IX. ETHICAL AND CLINICAL DEPLOYMENT CONSIDERATIONS
+A. Population Generalizability
+The RSNA dataset is drawn from two U.S. academic centers [16], and models trained on it may not generalize to other populations, imaging equipment, or ethnic groups without external validation — a concern already raised for skeletal-dysplasia and non-typical-development cohorts [4]. Any deployment of OSGA-Net or a comparable model outside a population resembling the training distribution should be preceded by local validation.
+B. Decision-Support Framing
+Any clinical use of OSGA-Net or a comparable model should be positioned as decision support rather than a replacement for radiologist judgment, should report the calibrated uncertainty produced by its ordinal distribution head alongside the point estimate so that clinicians can identify low-confidence cases, and should undergo prospective validation on a locally representative patient population before use in diagnosis or treatment planning.
+C. Data Governance
+All experiments described in this paper use the RSNA Pediatric Bone Age dataset strictly under its published academic research and education terms of use [31]; no patient-identifying information is processed beyond what is already de-identified in the public release, and no data beyond this real, de-identified, publicly released dataset is used at any stage.
+D. Informed Consent and Institutional Review
+The RSNA Pediatric Bone Age dataset was assembled and de-identified by its originating institutions, Children's Hospital Colorado and Lucile Packard Children's Hospital at Stanford, prior to its public release for the 2017 challenge [16]; this paper uses only that already-de-identified, publicly released data and does not collect, access, or process any new patient data, so no additional institutional review was sought or required for the literature analysis and protocol specification in Sections II–VII. Any future prospective clinical validation of a trained OSGA-Net model, as distinct from the retrospective benchmark evaluation specified here, would require its own institutional review and consent process at the deploying site.
+E. Broader Impact
+A structural, region-aware model whose output includes calibrated uncertainty could plausibly reduce radiologist workload on high-confidence cases while directing attention toward genuinely ambiguous ones, consistent with the workflow argument in Section VII-E. The same properties that make OSGA-Net's design appealing — explicit anatomical localization and a graph over named bones — also make its intermediate outputs (heatmaps, per-node features, attention weights) more interpretable to a radiologist than an end-to-end scalar regressor, which the authors view as a secondary but clinically relevant benefit distinct from raw accuracy.
+F. Regulatory Considerations
+A bone-age model intended for clinical use, rather than research benchmarking, would in most jurisdictions be regulated as software-as-a-medical-device and would require evidence of safety and effectiveness on a population representative of its intended use, typically including performance stratified by sex, age, and site — exactly the stratified evaluation already specified in Section VI-B, but extended to sites and populations beyond the two U.S. academic centers contributing to RSNA [16]. This paper does not claim regulatory-grade validation; Sections VII–IX are intended to establish a transparent, reproducible research baseline from which such a validation study could, if warranted by the planned results, subsequently be designed.
+X. CONCLUSION AND FUTURE WORK
+This paper proposed OSGA-Net, which departs from prior fusion strategies (concatenation [1], [5] and cross-attention pooling) by explicitly localizing ossification regions, conditioning them via per-node FiLM, reasoning with a Graph Attention Network over anatomical adjacency, and predicting a calibrated age distribution. Its design is motivated by, and benchmarked against, a table of real, published results measured on the real RSNA dataset (Table IV) rather than synthetic figures, and its own evaluation protocol (Sections V–VII) is specified precisely enough to be executed and reported on that same real dataset without alteration.
+The concrete near-term roadmap is: (i) execute Stage 1 and Stage 2 training (Section IV-G) and the six-model baseline suite (Section VI-A) on the real RSNA splits; (ii) populate Table IV's OSGA-Net row and Table V's ablation rows with the resulting real measurements, retaining the paired-bootstrap significance testing of Section VI-E; (iii) replace pseudo-landmark supervision with radiologist-annotated keypoints where available, to isolate how much of any observed gain is attributable to the graph-reasoning mechanism versus landmark quality; (iv) explore learning rather than fixing the anatomical adjacency once sufficient real training data or regularization is available to do so safely (Section IV-J); and (v) validate generalization on skeletal dysplasia cohorts [4] and on the real RHPE dataset (Section V-F) to characterize the cross-population and cross-site generalization gap already observed for other real-data baselines in this literature.
+Beyond this near-term roadmap, two longer-term extensions follow naturally from the architecture of Section IV. First, the auxiliary landmark head (Section IV-B) could be extended to predict additional TW-style maturity substages per region, providing a multi-task signal that more closely mirrors full TW3 scoring rather than only region localization. Second, the calibrated distribution output (Section IV-F) could be extended from a single age distribution to a joint distribution over per-region maturity stages, propagated through the same graph structure, which would let the model express not only “how old is this patient” but “which specific regions are driving that estimate and how confident is the model in each,” directly supporting the interpretability argument of Section VII-E.
+Appendix. ANATOMICAL ADJACENCY DEFINITION
+Table IX lists the fixed edge set A used by the GAT in Section IV-E, defining anatomical adjacency between the thirteen ossification-region nodes introduced in Section IV-B.
+Node A
+Node B
+Distal radius
+Carpal cluster (radial side)
+Distal ulna
+Carpal cluster (ulnar side)
+Carpal cluster (radial)
+Metacarpal I / II
+Carpal cluster (ulnar)
+Metacarpal IV / V
+Metacarpal I
+Phalanx (thumb)
+Metacarpal II
+Phalanx (index, proximal)
+Metacarpal III
+Phalanx (middle, proximal)
+Metacarpal IV
+Phalanx (ring, proximal)
+Metacarpal V
+Phalanx (little, proximal)
+Phalanx (index, proximal)
+Phalanx (middle, proximal)*
+TABLE IX. Representative anatomical adjacency edges. *Cross-ray edges such as this one connect corresponding joints across adjacent fingers, letting the GAT compare symmetric ossification centers as radiologists do during manual scoring.
+Appendix B. TENSOR SHAPES THROUGH THE PIPELINE
+Table X lists the tensor shape produced at each stage of Algorithm 1 for a single input image, to make the dimensional bookkeeping of Section IV concrete for reimplementation.
+Stage
+Output Shape
+Input radiograph
+1 x 384 x 384
+Backbone feature map F
+1280 x 12 x 12
+Landmark heatmaps H
+13 x 12 x 12
+Node features v_r (each)
+1280
+FiLM γ, β (each, per node)
+1280
+GAT hidden (per head)
+256
+GAT output (4 heads concat.)
+1024
+Graph readout g
+1024
+Output distribution p_pred
+228
+TABLE X. Tensor shapes at each pipeline stage (channels x height x width for image-like tensors, feature dimension otherwise).
+Appendix C. GLOSSARY OF ABBREVIATIONS
+Abbrev.
+Meaning
+BAA
+Bone Age Assessment
+G&P / TW
+Greulich-Pyle / Tanner-Whitehouse methods
+MAE / RMSE
+Mean Absolute Error / Root Mean Square Error
+MAD
+Mean Absolute Distance (RSNA challenge metric)
+GAT
+Graph Attention Network
+FiLM
+Feature-wise Linear Modulation
+LDL
+Label Distribution Learning
+RoI
+Region of Interest
+CLAHE
+Contrast Limited Adaptive Histogram Equalization
+RSNA / RHPE
+Radiological Society of North America dataset / Radiological Hand Pose Estimation dataset
+TABLE XI. Abbreviations used throughout this paper.
+Appendix D. DATA AND CODE AVAILABILITY
+The RSNA Pediatric Bone Age dataset used throughout this paper is publicly available under the terms described in [31]; no other dataset, real or synthetic, is used for any reported number in this paper. Source code implementing the architecture of Section IV, the preprocessing pipeline of Section V, and the training and evaluation protocol of Section VI is intended for public release alongside the completed experimental results referenced in Section VII, so that Table IV's pending OSGA-Net row and Table V's ablation rows can be independently reproduced once populated.
+REFERENCES
+[1]J. K. Kim, D. Park, and M. C. Choi, "Assessment of bone age based on hand radiographs using regression-based multi-modal deep learning," Life, vol. 14, no. 6, p. 774, 2024.
+[2]T. Palaniswamy, "An automated metaheuristic tunicate swarm algorithm based deep convolutional neural network for bone age assessment model," Ain Shams Eng. J., vol. 15, no. 10, p. 102942, 2024.
+[3]X. Mao, Q. Hui, S. Zhu, W. Du, C. Qiu, X. Ouyang, and D. Kong, "Automated skeletal bone age assessment with two-stage convolutional transformer network based on X-ray images," Diagnostics, vol. 13, no. 11, p. 1837, 2023.
+[4]S. Rassmann, A. Keller, K. Skaf et al., "Deeplasia: Deep learning for bone age assessment validated on skeletal dysplasias," Pediatr. Radiol., vol. 54, no. 1, pp. 82-95, 2024.
+[5]Z. Y. Hamd, A. I. Alorainy, M. A. Alharbi, A. Hamdoun, A. Alkhedeiri, S. Alhegail, N. Absar, M. U. Khandaker, and A. F. I. Osman, "Deep learning-based automated bone age estimation for Saudi patients on hand radiograph images: A retrospective study," BMC Med. Imaging, vol. 24, p. 199, 2024.
+[6]Y. Liu et al., "Bone age assessment based on deep neural networks with annotation-free cascaded critical bone region extraction," Front. Artif. Intell., vol. 6, p. 1142895, 2023.
+[7]"Multi-scale multi-reception attention network (BoGFF-Net) for bone age assessment in X-ray images," Neural Netw., vol. 158, pp. 258-271, 2023.
+[8]J. T. Bram, A. Pareek, S. A. Beber, R. H. Jones, M. M. Shariatnia, A. Daliliyazdi, O. C. Tracey, D. W. Green, and P. D. Fabricant, "Determination of skeletal age from hand radiographs using deep learning," Am. J. Sports Med. (SAGE), 2025.
+[9]K. Cao, C. Liu, J. Du, L. Duan, L. Li, Y. Ma, and H. Jung, "A developmental stage-aware graph transformer framework for automated bone-age assessment," Quant. Imaging Med. Surg., 2025.
+[10]M. Chu, B. Liu, F. Zhou, X. Bai, and B. Guo, "Bone age assessment based on two-stage deep neural networks," in Proc. Int. Conf. Digital Image Computing: Techniques and Applications (DICTA), 2018, pp. 1-6.
+[11]S. Li, B. Liu, S. Li, X. Zhu, Y. Yan, and D. Zhang, "A deep learning-based computer-aided diagnosis method of X-ray images for bone age assessment," Complex Intell. Syst., vol. 8, pp. 1929-1939, 2022.
+[12]C. Chen, Z. Chen, X. Jin, L. Li, W. Speier, and C. W. Arnold, "Attention-guided discriminative region localization and label distribution learning for bone age assessment," IEEE J. Biomed. Health Inform., vol. 26, no. 3, pp. 1208-1218, 2022.
+[13]D. D. Martin, A. D. Calder, M. B. Ranke, G. Binder, and H. H. Thodberg, "Accuracy and self-validation of automated bone age determination," Sci. Rep., vol. 12, no. 1, p. 6388, 2022.
+[14]J. H. Lee, Y. J. Kim et al., "Bone age estimation using deep learning and hand X-ray images," Biomed. Eng. Lett., vol. 10, pp. 323-331, 2020.
+[15]I. Pan, H. H. Thodberg, S. S. Halabi, J. Kalpathy-Cramer, and D. B. Larson, "Improving automated pediatric bone age estimation using ensembles of models from the 2017 RSNA machine learning challenge," Radiol. Artif. Intell., vol. 1, no. 6, p. e190053, 2019.
+[16]S. S. Halabi, L. M. Prevedello, J. Kalpathy-Cramer et al., "The RSNA pediatric bone age machine learning challenge," Radiology, vol. 290, no. 2, pp. 498-503, 2018.
+[17]D. B. Larson, M. C. Chen, M. P. Lungren, S. S. Halabi, N. V. Stence, and C. P. Langlotz, "Performance of a deep-learning neural network model in assessing skeletal maturity on pediatric hand radiographs," Radiology, vol. 287, no. 1, pp. 313-322, 2018.
+[18]C. Spampinato, S. Palazzo, D. Giordano, M. Aldinucci, and R. Leonardi, "Deep learning for automated skeletal bone age assessment in X-ray images," Med. Image Anal., vol. 36, pp. 41-51, 2017.
+[19]V. I. Iglovikov, A. Rakhlin, A. A. Kalinin, and A. A. Shvets, "Paediatric bone age assessment using deep convolutional neural networks," in Deep Learning in Medical Image Analysis and Multimodal Learning for Clinical Decision Support, Springer, 2018, pp. 300-308.
+[20]M. Escobar, C. Gonzalez, F. Torres, L. Daza, G. Triana, and P. Arbelaez, "Hand pose estimation for pediatric bone age assessment," in Proc. MICCAI, 2019, pp. 531-539.
+[21]Y. Ji, H. Chen, D. Lin, X. Wu, and D. Lin, "PRSNet: Part relation and selection network for bone age assessment," in Proc. MICCAI, 2019, pp. 413-421.
+[22]Q. Lou, H. Yang et al., "A two-stream network with global-local feature fusion for bone age assessment," Sci. Rep., arXiv:2512.18331, 2025.
+[23]P. Velickovic, G. Cucurull, A. Casanova, A. Romero, P. Lio, and Y. Bengio, "Graph attention networks," in Proc. ICLR, 2018.
+[24]A. Dosovitskiy, L. Beyer, A. Kolesnikov et al., "An image is worth 16x16 words: Transformers for image recognition at scale," arXiv:2010.11929, 2020.
+[25]Z. Liu, Y. Lin, Y. Cao, H. Hu, Y. Wei, Z. Zhang, S. Lin, and B. Guo, "Swin transformer: Hierarchical vision transformer using shifted windows," in Proc. IEEE/CVF ICCV, 2021, pp. 9992-10002.
+[26]K. He, X. Zhang, S. Ren, and J. Sun, "Deep residual learning for image recognition," in Proc. IEEE CVPR, 2016, pp. 770-778.
+[27]K. He, G. Gkioxari, P. Dollar, and R. Girshick, "Mask R-CNN," in Proc. IEEE ICCV, 2017, pp. 2961-2969.
+[28]E. Perez, F. Strub, H. de Vries, V. Dumoulin, and A. Courville, "FiLM: Visual reasoning with a general conditioning layer," in Proc. AAAI, 2018, pp. 3942-3951.
+[29]D. N. Reznikov, D. V. Kuligovskiy, I. G. Vorontsova et al., "Determination of bone age based on hand radiography: From classical methods to artificial intelligence (a review)," Digit. Diagn., 2023.
+[30]S. S. Halabi et al., "RSNA Pediatric Bone Age Challenge (2017) — dataset description, sex/age distribution and terms of use," Radiological Society of North America, 2017. [Online]. Available: https://www.rsna.org/education/ai-resources-and-training/ai-image-challenge/rsna-pediatric-bone-age-challenge-2017

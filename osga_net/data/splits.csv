@@ -1,0 +1,10 @@
+id,boneage,male,path,split,fold
+1381,82.0,0,data/raw/boneage-training-dataset\1381.png,val,
+1385,36.0,1,data/raw/boneage-training-dataset\1385.png,val,
+1377,180.0,0,data/raw/boneage-training-dataset\1377.png,test,-1.0
+1384,156.0,1,data/raw/boneage-training-dataset\1384.png,test,-1.0
+1387,138.0,1,data/raw/boneage-training-dataset\1387.png,train,0.0
+1382,138.0,1,data/raw/boneage-training-dataset\1382.png,train,1.0
+1383,150.0,1,data/raw/boneage-training-dataset\1383.png,train,0.0
+1378,12.0,0,data/raw/boneage-training-dataset\1378.png,train,0.0
+1380,120.0,1,data/raw/boneage-training-dataset\1380.png,train,1.0
